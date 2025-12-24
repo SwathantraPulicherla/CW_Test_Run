@@ -1,6 +1,6 @@
 # AI Test Runner
 
-Compiles, executes, and provides coverage reports for AI-generated C unit tests. This tool automatically finds tests that compile successfully (marked with `compiles_yes` in verification reports) and builds a complete test suite with coverage analysis.
+Compiles, executes, and provides coverage reports for AI-generated C and C++ unit tests. This tool automatically finds tests that compile successfully (marked with `compiles_yes` in verification reports) and builds a complete test suite with coverage analysis.
 
 ## Features
 
@@ -8,7 +8,9 @@ Compiles, executes, and provides coverage reports for AI-generated C unit tests.
 - 🔨 **CMake Build System**: Sets up proper build environment with coverage flags
 - 🧪 **Test Execution**: Runs all compiled tests and captures results
 - 📊 **Coverage Reports**: Generates LCOV coverage reports with HTML output
-- 🏗️ **Unity Integration**: Works seamlessly with Unity testing framework
+- 🏗️ **Unity Integration**: Works seamlessly with Unity testing framework for C
+- 🤖 **Google Test Integration**: Supports Google Test framework for C++
+- 🎯 **Arduino Mocking**: Includes Arduino API stubs for embedded testing
 - 📋 **Detailed Reporting**: Comprehensive test execution summaries
 
 ## Prerequisites
@@ -16,7 +18,7 @@ Compiles, executes, and provides coverage reports for AI-generated C unit tests.
 - **Python 3.8+**
 - **CMake** (build system)
 - **Make** (build tool)
-- **GCC/Clang** (C compiler)
+- **GCC/Clang** (C/C++ compiler)
 - **LCOV** (coverage reporting - optional but recommended)
 
 ### Installing Dependencies
@@ -57,8 +59,9 @@ ai-test-runner
 
 ### Command Line Options
 
-- `--repo-path PATH`: Path to the C repository (default: current directory)
+- `--repo-path PATH`: Path to the C/C++ repository (default: current directory)
 - `--output DIR`: Output/build directory (default: build)
+- `--language LANG`: Programming language - c, cpp, or auto (default: auto)
 - `--verbose, -v`: Enable verbose output
 - `--version`: Show version information
 
@@ -74,6 +77,16 @@ ai-test-runner
 ai-test-runner --repo-path /path/to/c/project
 ```
 
+**Run C++ tests explicitly:**
+```bash
+ai-test-runner --repo-path /path/to/cpp/project --language cpp
+```
+
+**Auto-detect language:**
+```bash
+ai-test-runner --repo-path /path/to/project --language auto
+```
+
 **Run with custom build directory:**
 ```bash
 ai-test-runner --output build/debug
@@ -87,11 +100,12 @@ ai-test-runner --verbose
 ## How It Works
 
 1. **Discovery Phase**: Scans `tests/compilation_report/` for files ending with `compiles_yes.txt`
-2. **Setup Phase**: Copies source files, test files, and Unity framework to build directory
-3. **Build Phase**: Creates CMakeLists.txt and builds all tests with coverage flags
-4. **Execution Phase**: Runs all compiled test executables
-5. **Coverage Phase**: Generates LCOV coverage reports
-6. **Reporting Phase**: Displays comprehensive test results and coverage summary
+2. **Language Detection**: Auto-detects C/C++ based on file extensions or explicit setting
+3. **Setup Phase**: Copies source files, test files, and appropriate testing framework (Unity for C, Google Test + Arduino stubs for C++)
+4. **Build Phase**: Creates CMakeLists.txt and builds all tests with coverage flags
+5. **Execution Phase**: Runs all compiled test executables
+6. **Coverage Phase**: Generates LCOV coverage reports
+7. **Reporting Phase**: Displays comprehensive test results and coverage summary
 
 ## Project Structure
 

@@ -12,7 +12,7 @@ setup(
     version="1.0.0",
     author="AI Test Runner Team",
     author_email="testrunner@example.com",
-    description="Compiles, executes, and provides coverage for AI-generated C unit tests",
+    description="Compiles, executes, and provides coverage for AI-generated C and C++ unit tests",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/your-org/ai-test-runner",
@@ -37,7 +37,7 @@ setup(
             "ai-test-runner=ai_test_runner.cli:main",
         ],
     },
-    keywords="c testing unit-tests ai coverage cmake build execution",
+    keywords="c testing cpp unit-tests ai coverage cmake build execution arduino",
     project_urls={
         "Bug Reports": "https://github.com/your-org/ai-test-runner/issues",
         "Source": "https://github.com/your-org/ai-test-runner",
