@@ -12,9 +12,69 @@ from pathlib import Path
 import glob
 import re
 
-# Import DependencyAnalyzer from ai-c-test-generator
-sys.path.append(str(Path(__file__).parent.parent.parent / "ai-c-test-generator"))
-from ai_c_test_generator.analyzer import DependencyAnalyzer
+
+def _enforce_manual_review_gate(repo_root: Path) -> None:
+    """MANDATORY HUMAN REVIEW GATE — DO NOT BYPASS.
+
+    Blocks any build/run unless per-test approval flag(s) exist and match required content.
+    On failure, prints the exact required message and exits non-zero.
+    """
+
+    review_dir = repo_root / "tests" / "review"
+    review_required_path = review_dir / "review_required.md"
+    required = "approved = true\nreviewed_by = <human_name>\ndate = <ISO date>\n"
+
+    def _parse_generated_test_files(path: Path) -> list[Path]:
+        try:
+            text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        except Exception:
+            return []
+
+        lines = text.split("\n")
+        in_section = False
+        generated: list[Path] = []
+
+        for line in lines:
+            if line.strip() == "## Generated test files":
+                in_section = True
+                continue
+            if in_section and line.startswith("## "):
+                break
+            if not in_section:
+                continue
+
+            stripped = line.strip()
+            if not stripped.startswith("-"):
+                continue
+            item = stripped.lstrip("-").strip()
+            if not item or item == "(none)":
+                continue
+
+            # Normalize separators and interpret as repo-relative.
+            item = item.replace("\\", "/")
+            generated.append(repo_root / Path(item))
+
+        return generated
+
+    generated_test_files = _parse_generated_test_files(review_required_path)
+    if not generated_test_files:
+        print("❌ Manual review not approved. Build and execution halted.")
+        raise SystemExit(3)
+
+    for test_path in generated_test_files:
+        approval_name = f"APPROVED.{test_path.name}.flag"
+        approved_path = review_dir / approval_name
+        try:
+            content = approved_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        except Exception:
+            print("❌ Manual review not approved. Build and execution halted.")
+            raise SystemExit(3)
+
+        if content != required:
+            print("❌ Manual review not approved. Build and execution halted.")
+            raise SystemExit(3)
+
+
 
 
 class AITestRunner:
@@ -22,15 +82,24 @@ class AITestRunner:
 
     def __init__(self, repo_path: str, output_dir: str = "build", language: str = "auto"):
         self.repo_path = Path(repo_path).resolve()
-        self.output_dir = self.repo_path / output_dir
+        out = Path(output_dir)
+        if out.is_absolute():
+            self.output_dir = out
+        else:
+            # Enforce build output under <repo>/tests/ to avoid separate top-level build folders.
+            # Examples:
+            #   output_dir=build         -> <repo>/tests/build
+            #   output_dir=tests/build   -> <repo>/tests/build
+            #   output_dir=ai_test_build -> <repo>/tests/ai_test_build
+            if out.parts[:1] == ("tests",):
+                self.output_dir = self.repo_path / out
+            else:
+                self.output_dir = self.repo_path / "tests" / out
         self.tests_dir = self.repo_path / "tests"
         self.verification_dir = self.tests_dir / "compilation_report"
         self.test_reports_dir = self.tests_dir / "test_reports"
         self.source_dir = self.repo_path / "src"
         self.language = language  # "c", "cpp", or "auto"
-
-        # Initialize dependency analyzer
-        self.analyzer = DependencyAnalyzer(str(self.repo_path))
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -908,14 +977,12 @@ const char* String::c_str() const {
         self.copy_test_files(test_files)
 
         # Create CMakeLists.txt
-        if not self.create_cmake_lists(test_files, language):
-            print("❌ Failed to create CMakeLists.txt")
-            return False
+        # self.create_cmake_lists(test_files, language)  # Project already has CMakeLists.txt
 
         # Configure CMake
         print("🔧 Configuring CMake...")
         try:
-            subprocess.run(["cmake", ".."], cwd=self.output_dir, check=True)
+            subprocess.run(["cmake", "-S", str(self.repo_path), "-B", str(self.output_dir), "-DRAILWAY_FETCH_GTEST=ON"], check=True)
         except subprocess.CalledProcessError as e:
             print(f"❌ CMake configuration failed: {e}")
             return False
@@ -960,7 +1027,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         default="build",
-        help="Output directory for build files (default: build)"
+        help="Output directory name under <repo>/tests/ (default: build -> tests/build)"
     )
     parser.add_argument(
         "--language",
@@ -975,6 +1042,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # MANDATORY HUMAN REVIEW GATE — DO NOT BYPASS
+    _enforce_manual_review_gate(Path(args.repo_path).resolve())
 
     # Create and run the test runner
     runner = AITestRunner(args.repo_path, args.output_dir, args.language)
