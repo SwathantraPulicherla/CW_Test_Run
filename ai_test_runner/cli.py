@@ -1060,7 +1060,7 @@ const char* String::c_str() const {
             return
 
         for exe in exes:
-            xml_path = self.test_reports_dir / f"{exe.stem}_gtest.xml"
+            xml_path = self.test_reports_dir / "interlocking_test_report.xml"
             try:
                 run = subprocess.run(
                     [str(exe), f"--gtest_output=xml:{xml_path}"],
