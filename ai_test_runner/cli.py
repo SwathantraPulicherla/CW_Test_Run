@@ -100,6 +100,7 @@ class AITestRunner:
         self.test_reports_dir = self.tests_dir / "test_reports"
         self.source_dir = self.repo_path / "src"
         self.language = language  # "c", "cpp", or "auto"
+        import xml.etree.ElementTree as ET
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -999,8 +1000,38 @@ const char* String::c_str() const {
         print("🧪 Running tests...")
         try:
             result = subprocess.run(["ctest", "--output-on-failure"], cwd=self.output_dir, capture_output=True, text=True)
-            # For simplicity, assume success if no exception
-            test_results = [{"passed": result.returncode == 0, "output": result.stdout + result.stderr}]
+            combined_output = (result.stdout or "") + (result.stderr or "")
+            no_tests_found = "No tests were found" in combined_output
+            test_results = [{
+                "passed": (result.returncode == 0) and (not no_tests_found),
+                "output": combined_output,
+            }]
+            # Emit per-test-case report for GoogleTest executables (function-scenario granularity).
+            try:
+                self._write_gtest_case_reports()
+            except Exception:
+                pass
+
+            # Always write a report artifact for the demo.
+            try:
+                report_path = self.test_reports_dir / "ctest_report.txt"
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write("=" * 60 + "\n")
+                    f.write("CTEST REPORT\n")
+                    f.write("=" * 60 + "\n\n")
+                    f.write(f"Return code: {result.returncode}\n\n")
+                    if no_tests_found:
+                        f.write("STATUS: FAILED (no tests were discovered by CTest)\n\n")
+                    else:
+                        f.write("STATUS: COMPLETED\n\n")
+                    f.write("--- STDOUT/STDERR ---\n")
+                    f.write(result.stdout or "")
+                    if result.stderr:
+                        f.write("\n--- STDERR ---\n")
+                        f.write(result.stderr)
+                print(f"   📄 Wrote report: {report_path.name}")
+            except Exception:
+                pass
         except subprocess.CalledProcessError as e:
             print(f"❌ Tests failed: {e}")
             test_results = []
@@ -1014,6 +1045,87 @@ const char* String::c_str() const {
 
         return True
 
+    def _write_gtest_case_reports(self):
+        """Run each built gtest executable with XML output and summarize per test case."""
+        import xml.etree.ElementTree as ET
+        tests_bin_dir = self.output_dir / "tests"
+        if not tests_bin_dir.exists():
+            return
+
+        exes = [p for p in tests_bin_dir.iterdir() if p.is_file() and p.suffix.lower() == ".exe"]
+        if not exes:
+            # Non-Windows builds may have no suffix.
+            exes = [p for p in tests_bin_dir.iterdir() if p.is_file() and p.suffix == "" and not p.name.endswith(".cmake")]
+        if not exes:
+            return
+
+        for exe in exes:
+            xml_path = self.test_reports_dir / f"{exe.stem}_gtest.xml"
+            try:
+                run = subprocess.run(
+                    [str(exe), f"--gtest_output=xml:{xml_path}"],
+                    cwd=tests_bin_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception:
+                continue
+
+            # Even if the executable fails, try to parse whatever it produced.
+            if not xml_path.exists():
+                continue
+
+            try:
+                root = ET.parse(xml_path).getroot()
+            except Exception:
+                continue
+
+            cases: list[dict] = []
+
+            # GoogleTest XML structure: <testsuites><testsuite name=...><testcase name=...><failure .../></testcase>...
+            for suite in root.findall(".//testsuite"):
+                suite_name = suite.attrib.get("name", "")
+                for case in suite.findall("testcase"):
+                    case_name = case.attrib.get("name", "")
+                    failures = case.findall("failure")
+                    status = "FAILED" if failures else "PASSED"
+                    cases.append({
+                        "suite": suite_name,
+                        "case": case_name,
+                        "status": status,
+                    })
+
+            if not cases:
+                continue
+
+            # Write a readable summary per executable.
+            summary_path = self.test_reports_dir / "interlocking_test_report.txt"
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write("=" * 60 + "\n")
+                f.write(f"GTEST CASE REPORT for interlocking.cpp\n")
+                f.write("=" * 60 + "\n\n")
+                passed = sum(1 for c in cases if c["status"] == "PASSED")
+                failed = sum(1 for c in cases if c["status"] == "FAILED")
+                f.write(f"Total cases: {len(cases)}\n")
+                f.write(f"Passed: {passed}\n")
+                f.write(f"Failed: {failed}\n\n")
+                for c in cases:
+                    f.write(f"{c['status']}: {c['suite']}.{c['case']}\n")
+                
+                # Add CTest summary
+                ctest_report_path = self.test_reports_dir / "ctest_report.txt"
+                if ctest_report_path.exists():
+                    f.write("\n\n" + "=" * 60 + "\n")
+                    f.write("CTEST SUMMARY\n")
+                    f.write("=" * 60 + "\n\n")
+                    try:
+                        with open(ctest_report_path, "r", encoding="utf-8") as ctest_f:
+                            f.write(ctest_f.read())
+                    except Exception:
+                        f.write("(Could not read CTest report)\n")
+
+            print(f"   📄 Wrote report: {summary_path.name}")
 
 def main():
     """Main entry point for the AI Test Runner."""
