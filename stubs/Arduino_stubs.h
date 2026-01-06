@@ -79,6 +79,9 @@ public:
     void print(const String& str);
     void println(const String& str);
     
+    void clear() { println_calls.clear(); print_calls.clear(); outputBuffer.clear(); }
+    std::string lastPrintln() { return println_calls.empty() ? "" : println_calls.back(); }
+    
     void reset();
 };
 
@@ -94,10 +97,13 @@ extern SerialClass Serial;
 
 class HTTPClient {
 public:
+    // Static mock control
+    static int mock_response_code;
+    static std::string mock_response_body;
+    
+    // Instance tracking (optional, but good for verification)
     int begin_call_count = 0;
     std::string begin_url;
-    int GET_return = 200;
-    std::string getString_return;
     
     void setTimeout(int ms);
     void begin(const String& url);
@@ -105,11 +111,17 @@ public:
     String getString();
     void end();
     
-    void reset();
+    static void reset();
 };
 
 class File {
 public:
+    // Static mock control
+    static bool mock_open_success;
+    static std::string mock_content;
+    static int mock_pos;
+    static std::vector<std::string> mock_printed;
+
     bool available();
     char read();
     void close();
@@ -120,6 +132,10 @@ public:
 
 class SPIFFSClass {
 public:
+    // Static mock control
+    static bool mock_begin_success;
+    static bool mock_begin_format_success;
+
     bool begin(bool format);
     bool begin();
     File open(const char* path, const char* mode = "r");

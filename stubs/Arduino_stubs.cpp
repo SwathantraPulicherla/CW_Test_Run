@@ -206,6 +206,10 @@ bool String::operator==(const String& other) const {
 
 #define HTTP_CODE_OK 200
 
+// Define static members
+int HTTPClient::mock_response_code = 200;
+std::string HTTPClient::mock_response_body = "";
+
 void HTTPClient::setTimeout(int ms) {
     // std::cout << "HTTPClient.setTimeout(" << ms << ")" << std::endl;
 }
@@ -217,12 +221,12 @@ void HTTPClient::begin(const String& url) {
 }
 
 int HTTPClient::GET() {
-    // std::cout << "HTTPClient.GET() -> " << GET_return << std::endl;
-    return GET_return;
+    // std::cout << "HTTPClient.GET() -> " << mock_response_code << std::endl;
+    return mock_response_code;
 }
 
 String HTTPClient::getString() {
-    return String(getString_return.c_str());
+    return String(mock_response_body.c_str());
 }
 
 void HTTPClient::end() {
@@ -230,19 +234,21 @@ void HTTPClient::end() {
 }
 
 void HTTPClient::reset() {
-    begin_call_count = 0;
-    begin_url = "";
-    GET_return = 200;
-    getString_return = "";
+    mock_response_code = 200;
+    mock_response_body = "";
 }
 
 SPIFFSClass SPIFFS;
 
 bool SPI_DEBUGGING = false;
 
+// Define static members
+bool SPIFFSClass::mock_begin_success = true;
+bool SPIFFSClass::mock_begin_format_success = true;
+
 bool SPIFFSClass::begin(bool format) {
-    std::cout << "SPIFFS.begin(" << format << ")" << std::endl;
-    return true;
+    // std::cout << "SPIFFS.begin(" << format << ")" << std::endl;
+    return mock_begin_success;
 }
 
 bool SPIFFSClass::begin() {
@@ -250,25 +256,59 @@ bool SPIFFSClass::begin() {
 }
 
 File SPIFFSClass::open(const char* path, const char* mode) {
-    std::cout << "SPIFFS.open(" << path << ", " << mode << ")" << std::endl;
-    return File();
+    // std::cout << "SPIFFS.open(" << path << ", " << mode << ")" << std::endl;
+    if (!File::mock_open_success) {
+        return File(); // Return invalid file
+    }
+    // In a real mock, we might return a valid file object that knows it's valid
+    // For now, File::operator bool() returns true by default, so we need to handle the "invalid" case
+    // But File is a value type here.
+    // Let's assume the default constructor creates a "valid" file unless we add a flag.
+    // Wait, File::operator bool() needs to know if it's valid.
+    // We should probably add an isValid flag to File instance.
+    // But for now, let's just rely on the static mock_open_success being checked by the test?
+    // No, the code checks `if (!file)`.
+    // So File needs an internal state.
+    File f;
+    // We need a way to mark 'f' as valid/invalid.
+    // Since we can't easily change the File class definition in the cpp file, 
+    // and I didn't add an isValid member in the header, 
+    // I should have added it.
+    // But wait, File::operator bool() is const.
+    // Let's assume for now that if mock_open_success is false, we return a File that evaluates to false.
+    // I need to update File class in header to support this state.
+    return f;
 }
 
+// Define static members
+bool File::mock_open_success = true;
+std::string File::mock_content = "";
+int File::mock_pos = 0;
+std::vector<std::string> File::mock_printed;
+
 bool File::available() {
-    static int count = 0;
-    return count++ < 10; // Simulate some data
+    return mock_pos < mock_content.length();
 }
 
 char File::read() {
-    return 'a'; // Dummy data
+    if (mock_pos < mock_content.length()) {
+        return mock_content[mock_pos++];
+    }
+    return 0;
 }
 
 void File::close() {
-    std::cout << "File.close()" << std::endl;
+    // std::cout << "File.close()" << std::endl;
 }
 
 File::operator bool() const {
-    return true; // Assume file is valid
+    // This is tricky without an instance member.
+    // But since we are using static mocks, maybe we can just return mock_open_success?
+    // The problem is that `if (!file)` is called on the returned object.
+    // If I return a File object, and mock_open_success was false when open() was called...
+    // Ideally, open() returns an object that knows it failed.
+    // Let's use the static flag for now, assuming single-threaded tests.
+    return mock_open_success; 
 }
 
 String File::readStringUntil(char terminator) {
@@ -281,6 +321,7 @@ String File::readStringUntil(char terminator) {
 }
 
 size_t File::print(const String& str) {
-    std::cout << str.content;
+    mock_printed.push_back(str.content);
+    // std::cout << str.content;
     return str.length();
 }
