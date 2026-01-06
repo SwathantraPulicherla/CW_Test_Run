@@ -1008,30 +1008,11 @@ const char* String::c_str() const {
             }]
             # Emit per-test-case report for GoogleTest executables (function-scenario granularity).
             try:
-                self._write_gtest_case_reports()
+                self._write_gtest_case_reports(result)
             except Exception:
                 pass
 
-            # Always write a report artifact for the demo.
-            try:
-                report_path = self.test_reports_dir / "ctest_report.txt"
-                with open(report_path, "w", encoding="utf-8") as f:
-                    f.write("=" * 60 + "\n")
-                    f.write("CTEST REPORT\n")
-                    f.write("=" * 60 + "\n\n")
-                    f.write(f"Return code: {result.returncode}\n\n")
-                    if no_tests_found:
-                        f.write("STATUS: FAILED (no tests were discovered by CTest)\n\n")
-                    else:
-                        f.write("STATUS: COMPLETED\n\n")
-                    f.write("--- STDOUT/STDERR ---\n")
-                    f.write(result.stdout or "")
-                    if result.stderr:
-                        f.write("\n--- STDERR ---\n")
-                        f.write(result.stderr)
-                print(f"   📄 Wrote report: {report_path.name}")
-            except Exception:
-                pass
+            # CTest data is now included in the interlocking_test_report.txt, no separate file needed
         except subprocess.CalledProcessError as e:
             print(f"❌ Tests failed: {e}")
             test_results = []
@@ -1045,7 +1026,7 @@ const char* String::c_str() const {
 
         return True
 
-    def _write_gtest_case_reports(self):
+    def _write_gtest_case_reports(self, ctest_result=None):
         """Run each built gtest executable with XML output and summarize per test case."""
         import xml.etree.ElementTree as ET
         tests_bin_dir = self.output_dir / "tests"
@@ -1114,16 +1095,24 @@ const char* String::c_str() const {
                     f.write(f"{c['status']}: {c['suite']}.{c['case']}\n")
                 
                 # Add CTest summary
-                ctest_report_path = self.test_reports_dir / "ctest_report.txt"
-                if ctest_report_path.exists():
-                    f.write("\n\n" + "=" * 60 + "\n")
-                    f.write("CTEST SUMMARY\n")
-                    f.write("=" * 60 + "\n\n")
-                    try:
-                        with open(ctest_report_path, "r", encoding="utf-8") as ctest_f:
-                            f.write(ctest_f.read())
-                    except Exception:
-                        f.write("(Could not read CTest report)\n")
+                f.write("\n\n" + "=" * 60 + "\n")
+                f.write("CTEST SUMMARY\n")
+                f.write("=" * 60 + "\n\n")
+                if ctest_result:
+                    combined_output = (ctest_result.stdout or "") + (ctest_result.stderr or "")
+                    no_tests_found = "No tests were found" in combined_output
+                    f.write(f"Return code: {ctest_result.returncode}\n\n")
+                    if no_tests_found:
+                        f.write("STATUS: FAILED (no tests were discovered by CTest)\n\n")
+                    else:
+                        f.write("STATUS: COMPLETED\n\n")
+                    f.write("--- STDOUT/STDERR ---\n")
+                    f.write(ctest_result.stdout or "")
+                    if ctest_result.stderr:
+                        f.write("\n--- STDERR ---\n")
+                        f.write(ctest_result.stderr)
+                else:
+                    f.write("(CTest data not available)\n")
 
             print(f"   📄 Wrote report: {summary_path.name}")
 
