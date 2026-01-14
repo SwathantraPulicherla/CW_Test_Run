@@ -3,6 +3,7 @@
 import os
 import pytest
 import subprocess
+from pathlib import Path as RealPath
 from unittest.mock import patch, MagicMock
 from ai_test_runner.cli import main, AITestRunner
 
@@ -25,20 +26,29 @@ class TestAITestRunner:
         # Mock the verification directory methods
         runner.verification_dir = MagicMock()
         runner.verification_dir.exists.return_value = True
-        runner.verification_dir.glob.return_value = [
-            MagicMock(stem='test1_compiles_yes'),
-            MagicMock(stem='test2_compiles_yes'),
-        ]
+        report1 = MagicMock()
+        report1.name = 'test1_compiles_yes.txt'
+        report1.relative_to.return_value = RealPath('src/mod/test1_compiles_yes.txt')
+
+        report2 = MagicMock()
+        report2.name = 'test2_compiles_yes.txt'
+        report2.relative_to.return_value = RealPath('src/mod/test2_compiles_yes.txt')
+
+        runner.verification_dir.rglob.return_value = [report1, report2]
 
         # Mock the tests directory and test files
         runner.tests_dir = MagicMock()
-        def mock_truediv(filename):
+
+        mid = MagicMock()
+        runner.tests_dir.__truediv__.return_value = mid
+
+        def mid_div(filename):
             mock_file = MagicMock()
             mock_file.exists.return_value = True
-            mock_file.stem = filename.replace('.c', '')
-            mock_file.name = filename
+            mock_file.stem = str(filename).replace('.cpp', '').replace('.c', '')
+            mock_file.name = str(filename)
             return mock_file
-        runner.tests_dir.__truediv__.side_effect = mock_truediv
+        mid.__truediv__.side_effect = mid_div
 
         tests = runner.find_compilable_tests()
 

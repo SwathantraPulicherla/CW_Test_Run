@@ -22,7 +22,63 @@ def _enforce_manual_review_gate(repo_root: Path) -> None:
 
     review_dir = repo_root / "tests" / "review"
     review_required_path = review_dir / "review_required.md"
-    required = "approved = true\nreviewed_by = <human_name>\ndate = <ISO date>\n"
+
+    def _approval_flag_candidates(test_path: Path) -> list[Path]:
+        """Return candidate approval flag paths.
+
+        Preferred (mirrors project structure under tests/): tests/review/<repo-path-under-tests>.flag
+        Back-compat (older mirrored scheme): tests/review/<repo-relative test path>.flag
+        Legacy (back-compat): tests/review/APPROVED.<filename>.flag
+        """
+        try:
+            rel = test_path.relative_to(repo_root)
+        except Exception:
+            rel = Path(test_path.name)
+
+        # Strip leading tests/ so review artifacts mirror the repo layout.
+        rel_no_tests = rel
+        if rel_no_tests.parts[:1] == ("tests",):
+            rel_no_tests = Path(*rel_no_tests.parts[1:])
+
+        preferred = review_dir / rel_no_tests.parent / f"{rel_no_tests.name}.flag"
+        compat_mirrored = review_dir / rel.parent / f"{rel.name}.flag"
+        legacy = review_dir / f"APPROVED.{test_path.name}.flag"
+        return [preferred, compat_mirrored, legacy]
+    def _is_iso_date(value: str) -> bool:
+        import datetime
+        try:
+            datetime.date.fromisoformat(value)
+            return True
+        except Exception:
+            try:
+                datetime.datetime.fromisoformat(value)
+                return True
+            except Exception:
+                return False
+
+    def _approval_ok(content: str) -> bool:
+        text = (content or "").replace("\r\n", "\n")
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) < 3:
+            return False
+        if lines[0].lower() != "approved = true":
+            return False
+        if not lines[1].lower().startswith("reviewed_by ="):
+            return False
+        if not lines[2].lower().startswith("date ="):
+            return False
+
+        reviewed_by = lines[1].split("=", 1)[1].strip() if "=" in lines[1] else ""
+        date_val = lines[2].split("=", 1)[1].strip() if "=" in lines[2] else ""
+
+        # Reject placeholders.
+        if reviewed_by in ("", "<human_name>"):
+            return False
+        if date_val in ("", "<ISO date>"):
+            return False
+        if not _is_iso_date(date_val):
+            return False
+        return True
 
     def _parse_generated_test_files(path: Path) -> list[Path]:
         try:
@@ -52,7 +108,16 @@ def _enforce_manual_review_gate(repo_root: Path) -> None:
 
             # Normalize separators and interpret as repo-relative.
             item = item.replace("\\", "/")
-            generated.append(repo_root / Path(item))
+            candidate = Path(item)
+            if candidate.is_absolute():
+                resolved = candidate
+            else:
+                resolved = repo_root / candidate
+                if not resolved.exists():
+                    alt = repo_root / "tests" / candidate
+                    if alt.exists():
+                        resolved = alt
+            generated.append(resolved)
 
         return generated
 
@@ -62,15 +127,17 @@ def _enforce_manual_review_gate(repo_root: Path) -> None:
         raise SystemExit(3)
 
     for test_path in generated_test_files:
-        approval_name = f"APPROVED.{test_path.name}.flag"
-        approved_path = review_dir / approval_name
-        try:
-            content = approved_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-        except Exception:
-            print("❌ Manual review not approved. Build and execution halted.")
-            raise SystemExit(3)
+        content = ""
+        found = False
+        for approved_path in _approval_flag_candidates(test_path):
+            try:
+                content = approved_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                found = True
+                break
+            except Exception:
+                continue
 
-        if content != required:
+        if not found or not _approval_ok(content):
             print("❌ Manual review not approved. Build and execution halted.")
             raise SystemExit(3)
 
@@ -97,15 +164,36 @@ class AITestRunner:
                 self.output_dir = self.repo_path / "tests" / out
         self.tests_dir = self.repo_path / "tests"
         self.verification_dir = self.tests_dir / "compilation_report"
-        self.test_reports_dir = self.tests_dir / "test_reports"
+        self.test_reports_root = self.tests_dir / "test_reports"
         self.source_dir = self.repo_path / "src"
         self.language = language  # "c", "cpp", or "auto"
+        self.ctest_regex: str | None = None
+        self.report_group: str = "all"
         import xml.etree.ElementTree as ET
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # Create test reports directory
-        self.test_reports_dir.mkdir(parents=True, exist_ok=True)
+        self.test_reports_root.mkdir(parents=True, exist_ok=True)
+
+    def _sanitize_group_name(self, name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip())
+        return safe or "all"
+
+    def _derive_report_group(self) -> str:
+        if self.ctest_regex:
+            # When demo selects a single file it passes the stem; when multiple it passes `a|b|c`.
+            parts = [p.strip() for p in self.ctest_regex.split("|") if p.strip()]
+            if len(parts) == 1:
+                return self._sanitize_group_name(parts[0])
+            return "selected"
+        return "all"
+
+    def _report_dir(self) -> Path:
+        self.report_group = self._derive_report_group()
+        report_dir = self.test_reports_root / self.report_group
+        report_dir.mkdir(parents=True, exist_ok=True)
+        return report_dir
 
     def detect_language(self, test_files):
         """Detect the programming language from test files"""
@@ -135,17 +223,17 @@ class AITestRunner:
             print(f"❌ Verification report directory not found: {self.verification_dir}")
             return compilable_tests
 
-        # Find all compiles_yes files
-        for report_file in self.verification_dir.glob("*compiles_yes.txt"):
-            # Extract test filename from report filename
-            base_name = report_file.stem.replace("_compiles_yes", "")
-            
-            # Try both .c and .cpp extensions
-            for ext in ['.c', '.cpp', '.cc', '.cxx', '.c++']:
-                test_file = self.tests_dir / f"{base_name}{ext}"
+        # Find all compiles_yes files (recursive; reports mirror test folder structure)
+        for report_file in self.verification_dir.rglob("*compiles_yes.txt"):
+            rel_report = report_file.relative_to(self.verification_dir)
+            base_name = report_file.name.replace("_compiles_yes.txt", "")
+
+            # Try both .c and .cpp extensions under the same mirrored subfolder.
+            for ext in ['.cpp', '.cc', '.cxx', '.c++', '.c']:
+                test_file = self.tests_dir / rel_report.parent / f"{base_name}{ext}"
                 if test_file.exists():
                     compilable_tests.append(test_file)
-                    print(f"✅ Found compilable test: {test_file.name}")
+                    print(f"✅ Found compilable test: {test_file}")
                     break
 
         return compilable_tests
@@ -983,7 +1071,28 @@ const char* String::c_str() const {
         # Configure CMake
         print("🔧 Configuring CMake...")
         try:
-            subprocess.run(["cmake", "-S", str(self.repo_path), "-B", str(self.output_dir), "-DRAILWAY_FETCH_GTEST=ON"], check=True)
+            cmake_args = [
+                "cmake",
+                "-S",
+                str(self.repo_path),
+                "-B",
+                str(self.output_dir),
+                "-DRAILWAY_FETCH_GTEST=ON",
+            ]
+
+            # Compatibility: this demo repo uses a namespaced option.
+            try:
+                top_cmake = (self.repo_path / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
+                # Generic coverage flag for any repo that supports it.
+                # Use a word-boundary-ish regex so we don't match namespaced options.
+                if re.search(r"(?<![A-Z0-9_])ENABLE_COVERAGE(?![A-Z0-9_])", top_cmake):
+                    cmake_args.append("-DENABLE_COVERAGE=ON")
+                if "RAILWAY_ENABLE_COVERAGE" in top_cmake:
+                    cmake_args.append("-DRAILWAY_ENABLE_COVERAGE=ON")
+            except Exception:
+                pass
+
+            subprocess.run(cmake_args, check=True)
         except subprocess.CalledProcessError as e:
             print(f"❌ CMake configuration failed: {e}")
             return False
@@ -999,7 +1108,10 @@ const char* String::c_str() const {
         # Run tests
         print("🧪 Running tests...")
         try:
-            result = subprocess.run(["ctest", "--output-on-failure"], cwd=self.output_dir, capture_output=True, text=True)
+            ctest_cmd = ["ctest", "--output-on-failure"]
+            if self.ctest_regex:
+                ctest_cmd.extend(["-R", self.ctest_regex])
+            result = subprocess.run(ctest_cmd, cwd=self.output_dir, capture_output=True, text=True)
             combined_output = (result.stdout or "") + (result.stderr or "")
             no_tests_found = "No tests were found" in combined_output
             test_results = [{
@@ -1040,8 +1152,45 @@ const char* String::c_str() const {
         if not exes:
             return
 
+        report_root = self._report_dir()
+
+        def _per_exe_report_dir(exe_name: str) -> Path:
+            """Place reports under tests/test_reports/<group>/<mirrored test path>/"""
+            # Map executable name back to its source test path.
+            # CMake may name exes like: test_Foo__src__bar (stem + '__' + dir with '/' -> '__').
+            stem = exe_name.split("__", 1)[0]
+            dir_safe = exe_name.split("__", 1)[1] if "__" in exe_name else ""
+
+            test_src: Path | None = None
+            if dir_safe:
+                rel_dir = Path(*[p for p in dir_safe.split("__") if p])
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    candidate = self.tests_dir / rel_dir / f"{stem}{ext}"
+                    if candidate.exists():
+                        test_src = candidate
+                        break
+
+            if test_src is None:
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    hits = list(self.tests_dir.rglob(f"{stem}{ext}"))
+                    if hits:
+                        test_src = hits[0]
+                        break
+            if test_src is None:
+                report_dir = report_root
+            else:
+                try:
+                    rel = test_src.relative_to(self.tests_dir)
+                    report_dir = report_root / rel.parent
+                except Exception:
+                    report_dir = report_root
+
+            report_dir.mkdir(parents=True, exist_ok=True)
+            return report_dir
+
         for exe in exes:
-            xml_path = self.test_reports_dir / "interlocking_test_report.xml"
+            per_dir = _per_exe_report_dir(exe.name)
+            xml_path = per_dir / f"{exe.name}_gtest.xml"
             try:
                 run = subprocess.run(
                     [str(exe), f"--gtest_output=xml:{xml_path}"],
@@ -1081,11 +1230,13 @@ const char* String::c_str() const {
                 continue
 
             # Write a readable summary per executable.
-            summary_path = self.test_reports_dir / "interlocking_test_report.txt"
+            summary_path = per_dir / f"{exe.name}_test_report.txt"
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write("=" * 60 + "\n")
-                f.write(f"GTEST CASE REPORT for interlocking.cpp\n")
+                f.write(f"GTEST CASE REPORT\n")
                 f.write("=" * 60 + "\n\n")
+                f.write(f"Group: {self.report_group}\n")
+                f.write(f"Executable: {exe.name}\n\n")
                 passed = sum(1 for c in cases if c["status"] == "PASSED")
                 failed = sum(1 for c in cases if c["status"] == "FAILED")
                 f.write(f"Total cases: {len(cases)}\n")
@@ -1131,6 +1282,11 @@ def main():
         help="Output directory name under <repo>/tests/ (default: build -> tests/build)"
     )
     parser.add_argument(
+        "--ctest-regex",
+        default=None,
+        help="Optional: pass a regex to ctest via -R to run only matching tests",
+    )
+    parser.add_argument(
         "--language",
         choices=["c", "cpp", "auto"],
         default="auto",
@@ -1149,6 +1305,7 @@ def main():
 
     # Create and run the test runner
     runner = AITestRunner(args.repo_path, args.output_dir, args.language)
+    runner.ctest_regex = args.ctest_regex
     success = runner.run()
 
     # Exit with appropriate code
