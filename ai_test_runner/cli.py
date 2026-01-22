@@ -11,6 +11,10 @@ import subprocess
 from pathlib import Path
 import glob
 import re
+import json
+import hashlib
+
+from .safety_policy import SafetyPolicy, save_safety_summary
 
 
 def _enforce_manual_review_gate(repo_root: Path) -> None:
@@ -142,6 +146,264 @@ def _enforce_manual_review_gate(repo_root: Path) -> None:
             raise SystemExit(3)
 
 
+def _cmake_test_name_for_test_file_rel(test_file_rel: str) -> str:
+    """Match RailwaySignalSystem/tests/CMakeLists.txt naming scheme.
+
+    test_file_rel is repo-relative (e.g. "tests/src/logic/test_Interlocking.cpp").
+    """
+    rel = (test_file_rel or "").replace("\\", "/")
+    if rel.startswith("tests/"):
+        rel = rel[len("tests/"):]
+    p = Path(rel)
+    stem = p.stem
+    dir_part = str(p.parent).replace("\\", "/")
+    if dir_part in ("", "."):
+        return stem
+    return f"{stem}__{dir_part.replace('/', '__')}"
+
+
+def _suite_prefix_from_section_name(section_name: str) -> str | None:
+    name = (section_name or "").strip()
+    if not name:
+        return None
+
+    # Demo-safe expected: <kind>_<index> (e.g. "base_1", "mcdc_2").
+    m = re.fullmatch(r"(?P<kind>[a-z_]+)_(?P<idx>\d+)", name)
+    if not m:
+        return None
+
+    kind = (m.group("kind") or "").strip().upper()
+    try:
+        idx = int(m.group("idx"))
+    except Exception:
+        return None
+
+    suffix = "" if idx == 1 else f"_{idx}"
+    return f"AISEC_{kind}{suffix}_"
+
+
+def _public_section_label(section: dict) -> str:
+    kind = str(section.get("kind") or "base").lower()
+    name = str(section.get("name") or "")
+    idx = None
+    m = re.fullmatch(r"[a-z_]+_(\d+)", name)
+    if m:
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            idx = None
+
+    if kind == "base":
+        return "BASE_TESTS"
+    if kind == "mcdc":
+        return f"MCDC_TESTS" + (f" (Decision_{idx})" if idx and idx > 1 else "")
+    if kind == "boundary":
+        return "BOUNDARY_TESTS"
+    if kind == "error_path":
+        return "ERROR_PATH_TESTS"
+    return "GENERATED_TESTS"
+
+
+def _compute_gtest_filter_for_scope(repo_root: Path, *, ctest_regex: str | None) -> str | None:
+    approvals_path = repo_root / "tests" / ".approvals.json"
+    if not approvals_path.exists():
+        return None
+
+    try:
+        data = json.loads(approvals_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    sections = (data or {}).get("sections", {})
+    if not isinstance(sections, dict):
+        return None
+
+    rx = re.compile(ctest_regex) if ctest_regex else None
+
+    patterns: list[str] = []
+    for _, s in sections.items():
+        if not isinstance(s, dict):
+            continue
+        if s.get("active") is not True:
+            continue
+        if s.get("approved") is not True:
+            continue
+
+        test_file_rel = s.get("test_file_rel")
+        if not isinstance(test_file_rel, str) or not test_file_rel:
+            continue
+
+        if rx is not None:
+            test_name = _cmake_test_name_for_test_file_rel(test_file_rel)
+            if rx.search(test_name) is None:
+                continue
+
+        suite_prefix = _suite_prefix_from_section_name(str(s.get("name") or ""))
+        if not suite_prefix:
+            continue
+        patterns.append(f"{suite_prefix}*.*")
+
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    uniq = [p for p in patterns if not (p in seen or seen.add(p))]
+    return ":".join(uniq) if uniq else None
+
+
+def _enforce_section_review_gate(repo_root: Path, *, ctest_regex: str | None) -> None:
+    """V2 section-based approvals gate.
+
+    If <repo>/tests/.approvals.json exists, it becomes the source of truth.
+    Otherwise we fall back to the legacy per-test-file approval flags.
+    """
+
+    approvals_path = repo_root / "tests" / ".approvals.json"
+    if not approvals_path.exists():
+        _enforce_manual_review_gate(repo_root)
+        return
+
+    try:
+        data = json.loads(approvals_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print("❌ Could not read approval data. Build and execution halted.")
+        raise SystemExit(3)
+
+    sections = (data or {}).get("sections", {})
+    if not isinstance(sections, dict):
+        print("❌ Invalid approval data. Build and execution halted.")
+        raise SystemExit(3)
+
+    active_sections: list[dict] = []
+    for _, s in sections.items():
+        if isinstance(s, dict) and s.get("active") is True:
+            active_sections.append(s)
+
+    # No active sections means nothing pending approval.
+    if not active_sections:
+        return
+
+    header_re = re.compile(r"(?ms)^/\*\s*(?:AI-TEST-SECTION|AI-TESTGEN-SECTION)\s*\n(?P<body>.*?)\*/\s*\n")
+
+    def _normalize_newlines(text: str) -> str:
+        return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    def _canonical_section_body(text: str) -> str:
+        """Canonicalize section body for stable hashing.
+
+        When sections are appended, extra blank separator lines can be inserted
+        between the end of one section body and the next section header.
+        Those separator newlines must not invalidate previously-approved hashes.
+        """
+
+        normalized = _normalize_newlines(text)
+        stripped = normalized.rstrip()
+        if not stripped:
+            return ""
+        return stripped + "\n"
+
+    def _sha256_text(text: str) -> str:
+        return hashlib.sha256(_normalize_newlines(text).encode("utf-8")).hexdigest()
+
+    def _parse_section_hashes(file_text: str) -> set[str]:
+        text = _normalize_newlines(file_text)
+        matches = list(header_re.finditer(text))
+        hashes: set[str] = set()
+        for idx, m in enumerate(matches):
+            body_start = m.end()
+            body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            hashes.add(_sha256_text(_canonical_section_body(text[body_start:body_end])))
+        return hashes
+
+    rx = re.compile(ctest_regex) if ctest_regex else None
+
+    for s in active_sections:
+        test_file_rel = s.get("test_file_rel")
+        if not isinstance(test_file_rel, str) or not test_file_rel:
+            print("❌ Invalid approvals entry (missing test_file_rel). Build and execution halted.")
+            raise SystemExit(3)
+
+        # If the caller is running a subset (ctest -R), only gate the relevant test executables.
+        if rx is not None:
+            test_name = _cmake_test_name_for_test_file_rel(test_file_rel)
+            if rx.search(test_name) is None:
+                continue
+
+        # Strict gate: if any ACTIVE section is unapproved (in-scope), do not start a build.
+        if s.get("approved") is not True:
+            print("❌ Pending section approvals exist (active). Build and execution halted.")
+            raise SystemExit(3)
+
+        section_sha = s.get("section_sha256")
+        if not test_file_rel or not section_sha:
+            print("❌ Invalid approval entry (missing required data). Build and execution halted.")
+            raise SystemExit(3)
+
+        test_file = (repo_root / test_file_rel).resolve()
+        try:
+            text = test_file.read_text(encoding="utf-8")
+        except Exception:
+            print(f"❌ Could not read approved test file: {test_file_rel}. Build and execution halted.")
+            raise SystemExit(3)
+
+        hashes = _parse_section_hashes(text)
+        if section_sha not in hashes:
+            label = _public_section_label(s)
+            print(
+                "❌ Approved content no longer matches the current test file. "
+                "Please re-approve the current content before building."
+            )
+            if label:
+                print(f"   Section: {label}")
+            print(f"   File: {test_file_rel}")
+            raise SystemExit(3)
+
+
+def _select_test_files_from_v2_approvals(repo_root: Path, *, ctest_regex: str | None) -> list[Path]:
+    """Best-effort selection of test files based on tests/.approvals.json.
+
+    When ctest_regex is provided, only includes test files whose CTest name matches.
+    Only ACTIVE+APPROVED sections contribute.
+    """
+
+    approvals_path = repo_root / "tests" / ".approvals.json"
+    if not approvals_path.exists():
+        return []
+
+    try:
+        data = json.loads(approvals_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    sections = (data or {}).get("sections", {})
+    if not isinstance(sections, dict):
+        return []
+
+    rx = re.compile(ctest_regex) if ctest_regex else None
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for s in sections.values():
+        if not isinstance(s, dict) or s.get("active") is not True:
+            continue
+        if s.get("approved") is not True:
+            continue
+
+        test_file_rel = s.get("test_file_rel")
+        if not isinstance(test_file_rel, str) or not test_file_rel:
+            continue
+
+        if rx is not None:
+            test_name = _cmake_test_name_for_test_file_rel(test_file_rel)
+            if rx.search(test_name) is None:
+                continue
+
+        p = (repo_root / test_file_rel).resolve()
+        if p.exists() and p not in seen:
+            seen.add(p)
+            files.append(p)
+
+    return files
+
+
 
 
 class AITestRunner:
@@ -190,10 +452,103 @@ class AITestRunner:
         return "all"
 
     def _report_dir(self) -> Path:
+        # Keep `report_group` as metadata for summaries, but do not encode it into
+        # the folder structure. Users expect reports to mirror source/test paths:
+        #   tests/test_reports/src/<...>/<file>
+        # not:
+        #   tests/test_reports/<regex-or-group>/src/<...>/<file>
         self.report_group = self._derive_report_group()
-        report_dir = self.test_reports_root / self.report_group
-        report_dir.mkdir(parents=True, exist_ok=True)
-        return report_dir
+        self.test_reports_root.mkdir(parents=True, exist_ok=True)
+
+        # One-time best-effort migration: older versions wrote reports under
+        # tests/test_reports/<group>/src/.... Move those into tests/test_reports/src/...
+        # so the on-disk layout is consistent and doesn't confuse users.
+        try:
+            legacy_dirs = [p for p in self.test_reports_root.iterdir() if p.is_dir() and p.name != "src"]
+            for legacy in legacy_dirs:
+                legacy_src = legacy / "src"
+                if not legacy_src.exists() or not legacy_src.is_dir():
+                    continue
+
+                target_src = self.test_reports_root / "src"
+                target_src.mkdir(parents=True, exist_ok=True)
+
+                for item in legacy_src.rglob("*"):
+                    if item.is_dir():
+                        continue
+                    rel = item.relative_to(legacy_src)
+                    dest = target_src / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.exists():
+                        # Preserve existing; keep legacy file with a suffix.
+                        dest = dest.with_name(dest.stem + "_legacy" + dest.suffix)
+                    try:
+                        shutil.move(str(item), str(dest))
+                    except Exception:
+                        pass
+
+                # Remove legacy folder if it's empty after move.
+                try:
+                    def _on_rm_error(func, path, exc_info):
+                        try:
+                            os.chmod(path, 0o700)
+                            func(path)
+                        except Exception:
+                            pass
+
+                    shutil.rmtree(legacy, onerror=_on_rm_error)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return self.test_reports_root
+
+    def _clean_report_root(self, report_root: Path) -> None:
+        """Normalize report layout so tests/test_reports stays readable.
+
+        Policy:
+        - Only keep a single `src/` tree plus a few top-level index files.
+        - Remove legacy/nested folders and previous-run artifacts.
+        """
+        report_root.mkdir(parents=True, exist_ok=True)
+
+        # Defensive: if an older layout accidentally created tests/test_reports/test_reports/...
+        nested = report_root / "test_reports"
+        if nested.exists() and nested.is_dir():
+            try:
+                shutil.rmtree(nested)
+            except Exception:
+                pass
+
+        # Remove prior run index files to keep the root tidy.
+        # Remove prior run index files to keep the root tidy.
+        for legacy_name in ("SUMMARY.txt", "RESULTS.csv", "RESULTS.xlsx"):
+            p = report_root / legacy_name
+            if p.exists() and p.is_file():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        # Remove any leftover index folder from older runs.
+        index_dir = report_root / "index"
+        if index_dir.exists() and index_dir.is_dir():
+            try:
+                shutil.rmtree(index_dir)
+            except Exception:
+                pass
+
+        # Wipe the mirrored tree every run to avoid accumulating legacy files.
+        src_dir = report_root / "src"
+        if src_dir.exists() and src_dir.is_dir():
+            try:
+                shutil.rmtree(src_dir)
+            except Exception:
+                pass
+        try:
+            src_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
     def detect_language(self, test_files):
         """Detect the programming language from test files"""
@@ -220,8 +575,9 @@ class AITestRunner:
         compilable_tests = []
 
         if not self.verification_dir.exists():
-            print(f"❌ Verification report directory not found: {self.verification_dir}")
-            return compilable_tests
+            print(f"⚠️  Verification report directory not found: {self.verification_dir}")
+            print("⚠️  Using approved test list to select tests.")
+            return _select_test_files_from_v2_approvals(self.repo_path, ctest_regex=getattr(self, 'ctest_regex', None))
 
         # Find all compiles_yes files (recursive; reports mirror test folder structure)
         for report_file in self.verification_dir.rglob("*compiles_yes.txt"):
@@ -235,6 +591,11 @@ class AITestRunner:
                     compilable_tests.append(test_file)
                     print(f"✅ Found compilable test: {test_file}")
                     break
+
+        if not compilable_tests:
+            print("⚠️  No verified compilable tests found.")
+            print("⚠️  Using approved test list to select tests.")
+            return _select_test_files_from_v2_approvals(self.repo_path, ctest_regex=getattr(self, 'ctest_regex', None))
 
         return compilable_tests
 
@@ -963,6 +1324,12 @@ const char* String::c_str() const {
                 f.write("\n" + "=" * 60 + "\n")
 
             print(f"   📄 Generated report: {report_file.name}")
+            # Also show the relative path for easier navigation.
+            try:
+                rel_print = report_file.relative_to(self.repo_path).as_posix()
+                print(f"      ↳ {rel_print}")
+            except Exception:
+                pass
 
     def generate_coverage(self):
         """Generate coverage reports (placeholder)"""
@@ -1111,9 +1478,26 @@ const char* String::c_str() const {
             ctest_cmd = ["ctest", "--output-on-failure"]
             if self.ctest_regex:
                 ctest_cmd.extend(["-R", self.ctest_regex])
-            result = subprocess.run(ctest_cmd, cwd=self.output_dir, capture_output=True, text=True)
+
+            env = os.environ.copy()
+            # If v2 section approvals exist, restrict execution to approved sections in-scope.
+            gtest_filter = _compute_gtest_filter_for_scope(self.repo_path, ctest_regex=self.ctest_regex)
+            if gtest_filter:
+                env["GTEST_FILTER"] = gtest_filter
+
+            result = subprocess.run(ctest_cmd, cwd=self.output_dir, capture_output=True, text=True, env=env)
             combined_output = (result.stdout or "") + (result.stderr or "")
             no_tests_found = "No tests were found" in combined_output
+
+            # Best-effort: extract how many tests GoogleTest reported running.
+            ran_count: int | None = None
+            try:
+                m = re.search(r"\[=+\]\s*Running\s+(\d+)\s+tests?\s+from\s+\d+\s+test\s+suites?\.", combined_output)
+                if m:
+                    ran_count = int(m.group(1))
+            except Exception:
+                ran_count = None
+
             test_results = [{
                 "passed": (result.returncode == 0) and (not no_tests_found),
                 "output": combined_output,
@@ -1129,8 +1513,16 @@ const char* String::c_str() const {
             print(f"❌ Tests failed: {e}")
             test_results = []
 
-        if not test_results or not test_results[0]["passed"]:
-            print("❌ No tests were executed or tests failed")
+        if not test_results:
+            print("❌ Tests did not run")
+            return False
+
+        if no_tests_found or ran_count == 0:
+            print("❌ No tests were executed")
+            return False
+
+        if not test_results[0]["passed"]:
+            print("❌ Tests failed")
             return False
 
         print("✅ All tests passed!")
@@ -1141,9 +1533,18 @@ const char* String::c_str() const {
     def _write_gtest_case_reports(self, ctest_result=None):
         """Run each built gtest executable with XML output and summarize per test case."""
         import xml.etree.ElementTree as ET
+        import datetime
+        import csv
         tests_bin_dir = self.output_dir / "tests"
         if not tests_bin_dir.exists():
             return
+
+        # Keep reports consistent with any approvals-based filtering.
+        env = os.environ.copy()
+        if self.ctest_regex:
+            gtest_filter = _compute_gtest_filter_for_scope(self.repo_path, ctest_regex=self.ctest_regex)
+            if gtest_filter:
+                env["GTEST_FILTER"] = gtest_filter
 
         exes = [p for p in tests_bin_dir.iterdir() if p.is_file() and p.suffix.lower() == ".exe"]
         if not exes:
@@ -1153,9 +1554,47 @@ const char* String::c_str() const {
             return
 
         report_root = self._report_dir()
+        self._clean_report_root(report_root)
+        run_started_utc = datetime.datetime.now(datetime.timezone.utc)
+        run_summaries: list[dict] = []
+
+
+        combined_ctest_output = ""
+        ctest_no_tests_found = False
+        ctest_return_code = None
+        if ctest_result is not None:
+            combined_ctest_output = (ctest_result.stdout or "") + (ctest_result.stderr or "")
+            ctest_no_tests_found = "No tests were found" in combined_ctest_output
+            ctest_return_code = ctest_result.returncode
+
+        def _ctest_failure_reason() -> str:
+            if ctest_result is None:
+                return "CTest data not available"
+            if ctest_no_tests_found:
+                return "CTest discovered 0 tests (\"No tests were found\")"
+            if ctest_return_code is not None and ctest_return_code != 0:
+                return f"CTest returned non-zero exit code ({ctest_return_code})"
+            return ""
+
+        def _ctest_output_excerpt(max_lines: int = 60) -> str:
+            if not combined_ctest_output:
+                return ""
+            lines = combined_ctest_output.replace("\r\n", "\n").split("\n")
+            lines = [ln for ln in lines if ln.strip()]
+            excerpt = "\n".join(lines[:max_lines])
+            if len(lines) > max_lines:
+                excerpt += "\n... (truncated)"
+            return excerpt
 
         def _per_exe_report_dir(exe_name: str) -> Path:
-            """Place reports under tests/test_reports/<group>/<mirrored test path>/"""
+            """Place reports under tests/test_reports/src/<parents>/<test_file_stem>/.
+
+            Desired layout:
+              tests/test_reports/src/<parents>/<test_file_stem>/
+                - gtest.xml
+                - <test_file_stem>_test_report.txt
+            """
+
             # Map executable name back to its source test path.
             # CMake may name exes like: test_Foo__src__bar (stem + '__' + dir with '/' -> '__').
             stem = exe_name.split("__", 1)[0]
@@ -1166,13 +1605,13 @@ const char* String::c_str() const {
                 rel_dir = Path(*[p for p in dir_safe.split("__") if p])
                 for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
                     candidate = self.tests_dir / rel_dir / f"{stem}{ext}"
-                    if candidate.exists():
+                    if candidate.exists() and candidate.is_file():
                         test_src = candidate
                         break
 
             if test_src is None:
                 for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
-                    hits = list(self.tests_dir.rglob(f"{stem}{ext}"))
+                    hits = [p for p in self.tests_dir.rglob(f"{stem}{ext}") if p.is_file()]
                     if hits:
                         test_src = hits[0]
                         break
@@ -1181,16 +1620,65 @@ const char* String::c_str() const {
             else:
                 try:
                     rel = test_src.relative_to(self.tests_dir)
-                    report_dir = report_root / rel.parent
+                    # Use the file stem as the final folder segment (avoid .cpp folders).
+                    report_dir = report_root / rel.parent / test_src.stem
                 except Exception:
                     report_dir = report_root
 
             report_dir.mkdir(parents=True, exist_ok=True)
             return report_dir
 
+        def _report_filename_for_exe(exe_name: str) -> str:
+            # Prefer the test file stem if we can resolve it; otherwise fall back to exe stem.
+            stem = exe_name.split("__", 1)[0]
+            dir_safe = exe_name.split("__", 1)[1] if "__" in exe_name else ""
+
+            test_src: Path | None = None
+            if dir_safe:
+                rel_dir = Path(*[p for p in dir_safe.split("__") if p])
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    candidate = self.tests_dir / rel_dir / f"{stem}{ext}"
+                    if candidate.exists() and candidate.is_file():
+                        test_src = candidate
+                        break
+
+            if test_src is None:
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    hits = [p for p in self.tests_dir.rglob(f"{stem}{ext}") if p.is_file()]
+                    if hits:
+                        test_src = hits[0]
+                        break
+
+            report_stem = test_src.stem if test_src is not None else stem
+            return f"{report_stem}_test_report.txt"
+
+        def _report_stem_for_exe(exe_name: str) -> str:
+            # The test file stem (preferred), otherwise the exe stem.
+            stem = exe_name.split("__", 1)[0]
+            dir_safe = exe_name.split("__", 1)[1] if "__" in exe_name else ""
+
+            test_src: Path | None = None
+            if dir_safe:
+                rel_dir = Path(*[p for p in dir_safe.split("__") if p])
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    candidate = self.tests_dir / rel_dir / f"{stem}{ext}"
+                    if candidate.exists() and candidate.is_file():
+                        test_src = candidate
+                        break
+
+            if test_src is None:
+                for ext in (".cpp", ".cc", ".cxx", ".c++", ".c"):
+                    hits = [p for p in self.tests_dir.rglob(f"{stem}{ext}") if p.is_file()]
+                    if hits:
+                        test_src = hits[0]
+                        break
+
+            return test_src.stem if test_src is not None else stem
+
         for exe in exes:
             per_dir = _per_exe_report_dir(exe.name)
-            xml_path = per_dir / f"{exe.name}_gtest.xml"
+            report_stem = _report_stem_for_exe(exe.name)
+            xml_path = per_dir / "gtest.xml"
             try:
                 run = subprocess.run(
                     [str(exe), f"--gtest_output=xml:{xml_path}"],
@@ -1198,6 +1686,7 @@ const char* String::c_str() const {
                     capture_output=True,
                     text=True,
                     timeout=60,
+                    env=env,
                 )
             except Exception:
                 continue
@@ -1220,21 +1709,32 @@ const char* String::c_str() const {
                     case_name = case.attrib.get("name", "")
                     failures = case.findall("failure")
                     status = "FAILED" if failures else "PASSED"
+                    failure_msg = ""
+                    failure_full = ""
+                    if failures:
+                        f0 = failures[0]
+                        failure_msg = (f0.attrib.get("message") or "").strip()
+                        failure_full = ((f0.text or "") or "").strip()
+                        if not failure_msg and failure_full:
+                            failure_msg = failure_full.splitlines()[0]
                     cases.append({
                         "suite": suite_name,
                         "case": case_name,
                         "status": status,
+                        "failure": failure_msg,
+                        "failure_full": failure_full,
                     })
 
             if not cases:
                 continue
 
             # Write a readable summary per executable.
-            summary_path = per_dir / f"{exe.name}_test_report.txt"
+            summary_path = per_dir / _report_filename_for_exe(exe.name)
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write("=" * 60 + "\n")
                 f.write(f"GTEST CASE REPORT\n")
                 f.write("=" * 60 + "\n\n")
+                f.write(f"Run (UTC): {run_started_utc.isoformat()}\n")
                 f.write(f"Group: {self.report_group}\n")
                 f.write(f"Executable: {exe.name}\n\n")
                 passed = sum(1 for c in cases if c["status"] == "PASSED")
@@ -1242,19 +1742,29 @@ const char* String::c_str() const {
                 f.write(f"Total cases: {len(cases)}\n")
                 f.write(f"Passed: {passed}\n")
                 f.write(f"Failed: {failed}\n\n")
-                for c in cases:
-                    f.write(f"{c['status']}: {c['suite']}.{c['case']}\n")
+
+                # Failed-first listing (most actionable at top).
+                ordered = sorted(
+                    cases,
+                    key=lambda c: (0 if c.get("status") == "FAILED" else 1, c.get("suite", ""), c.get("case", "")),
+                )
+                for c in ordered:
+                    line = f"{c['status']}: {c['suite']}.{c['case']}"
+                    if c.get("failure"):
+                        line += f"  |  {c['failure']}"
+                    f.write(line + "\n")
                 
                 # Add CTest summary
                 f.write("\n\n" + "=" * 60 + "\n")
                 f.write("CTEST SUMMARY\n")
                 f.write("=" * 60 + "\n\n")
                 if ctest_result:
-                    combined_output = (ctest_result.stdout or "") + (ctest_result.stderr or "")
-                    no_tests_found = "No tests were found" in combined_output
                     f.write(f"Return code: {ctest_result.returncode}\n\n")
-                    if no_tests_found:
+                    if ctest_no_tests_found:
                         f.write("STATUS: FAILED (no tests were discovered by CTest)\n\n")
+                        if self.ctest_regex:
+                            f.write(f"Note: You passed CTEST -R: {self.ctest_regex}\n")
+                            f.write("If the regex doesn't match any CTest names, zero tests run.\n\n")
                     else:
                         f.write("STATUS: COMPLETED\n\n")
                     f.write("--- STDOUT/STDERR ---\n")
@@ -1265,7 +1775,149 @@ const char* String::c_str() const {
                 else:
                     f.write("(CTest data not available)\n")
 
-            print(f"   📄 Wrote report: {summary_path.name}")
+            # Print the report path (relative to repo) for quick discovery.
+            try:
+                rel_print = summary_path.relative_to(self.repo_path).as_posix()
+            except Exception:
+                rel_print = str(summary_path)
+            print(f"   📄 Wrote report: {rel_print}")
+
+            # Write per-file SUMMARY and Excel/CSV results next to the report.
+            per_summary = per_dir / f"{report_stem}_SUMMARY.txt"
+            with open(per_summary, "w", encoding="utf-8") as f:
+                f.write("=" * 60 + "\n")
+                f.write("AI TEST REPORT – SUMMARY\n")
+                f.write("=" * 60 + "\n\n")
+                f.write(f"Run (UTC): {run_started_utc.isoformat()}\n")
+                f.write(f"Group: {self.report_group}\n")
+                if self.ctest_regex:
+                    f.write(f"CTEST -R: {self.ctest_regex}\n")
+                if env.get("GTEST_FILTER"):
+                    f.write(f"GTEST_FILTER: {env.get('GTEST_FILTER')}\n")
+                if ctest_return_code is not None:
+                    f.write(f"CTEST return code: {ctest_return_code}\n")
+                if ctest_no_tests_found:
+                    f.write("CTEST status: FAILED (no tests were discovered by CTest)\n")
+                reason = _ctest_failure_reason()
+                if reason:
+                    f.write(f"RUN FAILURE REASON: {reason}\n")
+                    if ctest_no_tests_found and self.ctest_regex:
+                        f.write("Likely cause: -R regex didn't match any CTest test names, or tests were not registered via add_test().\n")
+                    elif ctest_return_code is not None and ctest_return_code != 0 and not ctest_no_tests_found:
+                        f.write("Likely cause: one or more test cases failed (see FAILED list in the report).\n")
+                excerpt = _ctest_output_excerpt()
+                if excerpt:
+                    f.write("\nCTEST OUTPUT (excerpt)\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(excerpt + "\n")
+                f.write("\n")
+                f.write(f"Executable: {exe.name}\n")
+                f.write(f"Total cases: {len(cases)}\n")
+                f.write(f"Passed: {passed}\n")
+                f.write(f"Failed: {failed}\n")
+
+            try:
+                rel_print = per_summary.relative_to(self.repo_path).as_posix()
+            except Exception:
+                rel_print = str(per_summary)
+            print(f"   📄 Wrote report: {rel_print}")
+
+            per_case_rows: list[dict] = []
+            for c in cases:
+                # Keep full failure text readable in Excel by truncating.
+                failure_full = (c.get("failure_full") or "").replace("\r\n", "\n").strip()
+                if failure_full:
+                    flines = [ln for ln in failure_full.split("\n") if ln.strip()]
+                    failure_excerpt = "\n".join(flines[:10])
+                    if len(flines) > 10:
+                        failure_excerpt += "\n... (truncated)"
+                else:
+                    failure_excerpt = ""
+
+                per_case_rows.append(
+                    {
+                        "run_utc": run_started_utc.isoformat(),
+                        "ctest_regex": self.ctest_regex or "",
+                        "gtest_filter": env.get("GTEST_FILTER", ""),
+                        "ctest_return_code": "" if ctest_return_code is None else str(ctest_return_code),
+                        "ctest_no_tests_found": str(bool(ctest_no_tests_found)),
+                        "run_failure_reason": _ctest_failure_reason(),
+                        "ctest_output_excerpt": _ctest_output_excerpt(40),
+                        "executable": exe.name,
+                        "suite": c.get("suite", ""),
+                        "case": c.get("case", ""),
+                        "status": c.get("status", ""),
+                        "failure": c.get("failure", ""),
+                        "failure_details": failure_excerpt,
+                    }
+                )
+
+            if per_case_rows:
+                fieldnames = list(per_case_rows[0].keys())
+                # Prefer XLSX for testers; fall back to CSV if openpyxl isn't available.
+                wrote_xlsx = False
+                try:
+                    import openpyxl  # type: ignore
+                    from openpyxl.styles import Font  # type: ignore
+
+                    per_results_xlsx = per_dir / f"{report_stem}_RESULTS.xlsx"
+                    wb = openpyxl.Workbook()
+
+                    ws = wb.active
+                    ws.title = "Results"
+                    ws.append(fieldnames)
+                    for cell in ws[1]:
+                        cell.font = Font(bold=True)
+                    for row in per_case_rows:
+                        ws.append([row.get(k, "") for k in fieldnames])
+                    ws.freeze_panes = "A2"
+
+                    ws2 = wb.create_sheet("Summary")
+                    ws2.append(["Key", "Value"])
+                    for cell in ws2[1]:
+                        cell.font = Font(bold=True)
+                    ws2.append(["run_utc", run_started_utc.isoformat()])
+                    ws2.append(["group", self.report_group])
+                    ws2.append(["ctest_regex", self.ctest_regex or ""])
+                    ws2.append(["gtest_filter", env.get("GTEST_FILTER", "")])
+                    ws2.append(["ctest_return_code", "" if ctest_return_code is None else str(ctest_return_code)])
+                    ws2.append(["ctest_no_tests_found", str(bool(ctest_no_tests_found))])
+                    ws2.append(["run_failure_reason", _ctest_failure_reason()])
+                    ws2.append(["ctest_output_excerpt", _ctest_output_excerpt(80)])
+
+                    wb.save(per_results_xlsx)
+                    wrote_xlsx = True
+                    try:
+                        rel_print = per_results_xlsx.relative_to(self.repo_path).as_posix()
+                    except Exception:
+                        rel_print = str(per_results_xlsx)
+                    print(f"   📄 Wrote report: {rel_print}")
+                except Exception:
+                    wrote_xlsx = False
+
+                if not wrote_xlsx:
+                    per_results_csv = per_dir / f"{report_stem}_RESULTS.csv"
+                    with open(per_results_csv, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(per_case_rows)
+                    try:
+                        rel_print = per_results_csv.relative_to(self.repo_path).as_posix()
+                    except Exception:
+                        rel_print = str(per_results_csv)
+                    print(f"   📄 Wrote report: {rel_print}")
+
+            run_summaries.append(
+                {
+                    "exe": exe.name,
+                    "passed": passed,
+                    "failed": failed,
+                    "total": len(cases),
+                    "report": str(summary_path.relative_to(report_root)).replace("\\", "/")
+                    if summary_path.is_relative_to(report_root)
+                    else str(summary_path),
+                }
+            )
 
 def main():
     """Main entry point for the AI Test Runner."""
@@ -1298,15 +1950,67 @@ def main():
         version="%(prog)s 1.0.0"
     )
 
+    parser.add_argument(
+        "--safety-level",
+        choices=list(SafetyPolicy.allowed_levels()),
+        default="QM",
+        help=(
+            "Configures which analyses, test types, and review gates are required so generated tests align with SIL expectations "
+            "without claiming certification."
+        ),
+    )
+    parser.add_argument("--policy-file", default=None)
+    parser.add_argument(
+        "--disable-mcdc",
+        action="store_true",
+        help="Advanced override: disable MC/DC expectations even if the selected safety level would enable them.",
+    )
+
     args = parser.parse_args()
 
-    # MANDATORY HUMAN REVIEW GATE — DO NOT BYPASS
-    _enforce_manual_review_gate(Path(args.repo_path).resolve())
+    repo_root = Path(args.repo_path).resolve()
+    try:
+        policy = SafetyPolicy.load(
+            safety_level=args.safety_level,
+            repo_root=repo_root,
+            policy_file=args.policy_file,
+            disable_mcdc=bool(args.disable_mcdc),
+        )
+    except Exception:
+        # If policy loading fails, default to the safest stance: require approvals.
+        policy = SafetyPolicy(
+            safety_level=str(args.safety_level or "QM"),
+            approval_required=True,
+            coverage_target={},
+            mcdc_analysis=False,
+            mcdc_generation=False,
+        )
+
+    # Enforce approvals whenever v2 registry exists (source of truth).
+    # This prevents starting a build when pending active sections exist.
+    _enforce_section_review_gate(repo_root, ctest_regex=args.ctest_regex)
 
     # Create and run the test runner
     runner = AITestRunner(args.repo_path, args.output_dir, args.language)
     runner.ctest_regex = args.ctest_regex
     success = runner.run()
+
+    # Best-effort: update safety summary.
+    try:
+        save_safety_summary(
+            repo_root,
+            {
+                "safety_level": policy.safety_level,
+                "human_approvals_complete": bool(policy.approval_required),
+                "coverage_status": {
+                    "statement": "NOT_RUN",
+                    "branch": "NOT_RUN",
+                    "mcdc": "NOT_RUN" if policy.mcdc_expected() else "N/A",
+                },
+            },
+        )
+    except Exception:
+        pass
 
     # Exit with appropriate code
     sys.exit(0 if success else 1)
